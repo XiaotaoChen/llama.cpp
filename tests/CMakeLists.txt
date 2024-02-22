@@ -62,6 +62,8 @@ llama_build_and_test_executable(test-rope.cpp)
 llama_build_and_test_executable_with_label(test-model-load-cancel.cpp "model")
 llama_build_and_test_executable_with_label(test-autorelease.cpp "model")
 
+llama_build_and_test_executable(test-ldp-v2.cpp)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

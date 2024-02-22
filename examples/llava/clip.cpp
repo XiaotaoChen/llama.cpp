@@ -120,18 +120,24 @@ static std::string format(const char * fmt, ...) {
 #define TN_MVLM_PROJ_MLP   "mm.model.mlp.%d.%s"
 #define TN_MVLM_PROJ_BLOCK "mm.model.mb_block.%d.block.%d.%s"
 #define TN_IMAGE_NEWLINE   "model.image_newline"
+#define TN_MVLM_PROJ_PEG_MLP "mm.mlp.%d.%s"
+#define TN_MVLM_PROJ_PEG "mm.peg.proj.%d.%s"
 
 
 enum projector_type {
     PROJECTOR_TYPE_MLP,
     PROJECTOR_TYPE_MLP_NORM,
     PROJECTOR_TYPE_LDP,
+    PROJECTOR_TYPE_PEG,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
 static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
-    { PROJECTOR_TYPE_MLP, "mlp" },
-    { PROJECTOR_TYPE_LDP, "ldp" },
+    { PROJECTOR_TYPE_MLP,          "mlp"     },
+    { PROJECTOR_TYPE_MLP_NORM,     "mlp_norm"     },
+    { PROJECTOR_TYPE_LDP,          "ldp"    },
+    { PROJECTOR_TYPE_PEG,          "peg"    },
+    { PROJECTOR_TYPE_UNKNOWN,      "unknown"    },
 };
 
 
@@ -475,6 +481,15 @@ struct clip_vision_model {
     struct ggml_tensor * mm_model_block_2_block_2_0_w;
     struct ggml_tensor * mm_model_block_2_block_2_1_w;
     struct ggml_tensor * mm_model_block_2_block_2_1_b;
+
+    // PEG projector
+    struct ggml_tensor * mm_mlp_0_w;
+    struct ggml_tensor * mm_mlp_0_b;
+    struct ggml_tensor * mm_mlp_2_w;
+    struct ggml_tensor * mm_mlp_2_b;
+    struct ggml_tensor * mm_peg_proj_0_w;
+    struct ggml_tensor * mm_peg_proj_0_b;
+    struct ggml_tensor * mm_peg_ls_zeta;
 };
 
 struct clip_ctx {
@@ -807,6 +822,41 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
                 // block_1 shape = [1, 144, 2048], ne = [2048, 144, 1]
             }
             embeddings = block_1;
+        }
+        else if (ctx->proj_type == PROJECTOR_TYPE_PEG) {
+            // PEG projector
+            int n_patch = 24;
+            struct ggml_tensor * mlp_0 = ggml_mul_mat(ctx0, model.mm_mlp_0_w, embeddings);
+            mlp_0 = ggml_add(ctx0, mlp_0, model.mm_mlp_0_b);
+            mlp_0 = ggml_gelu(ctx0, mlp_0);
+            struct ggml_tensor * mlp_2 = ggml_mul_mat(ctx0, model.mm_mlp_2_w, mlp_0);
+            mlp_2 = ggml_add(ctx0, mlp_2, model.mm_mlp_2_b);
+            // transpose from [1, 576, 2048] --> [1, 2048, 576] --> [1, 2048, 24, 24]
+            mlp_2 = ggml_cont(ctx0, ggml_permute(ctx0, mlp_2, 1, 0, 2, 3));
+            mlp_2 = ggml_reshape_4d(ctx0, mlp_2, n_patch, n_patch, mlp_2->ne[1], mlp_2->ne[2]);
+
+            // print_tensor_info(mlp_2, "mlp_2");
+
+            // shape = [1, 2048, 12, 12]
+            embeddings = ggml_pool_2d(ctx0, mlp_2, GGML_OP_POOL_AVG, 2, 2, 2, 2, 0, 0);
+
+            // shape = [1, 2048, 144]
+            struct ggml_tensor* residual = ggml_reshape_3d(ctx0, embeddings, embeddings->ne[0]*embeddings->ne[1], embeddings->ne[2], embeddings->ne[3]);
+            // shape = [1, 144, 2048]
+            residual = ggml_cont(ctx0, ggml_permute(ctx0, residual, 1, 0, 2, 3));
+
+            // depthwise conv
+            embeddings = ggml_conv_depthwise_2d(ctx0, model.mm_peg_proj_0_w, embeddings, 1, 1, 1, 1, 1, 1);
+            struct ggml_tensor* peg_bias = ggml_reshape_4d(ctx0, model.mm_peg_proj_0_b, 1, 1, model.mm_peg_proj_0_b->ne[0], 1);
+            embeddings = ggml_add(ctx0, embeddings, peg_bias);
+            // ls
+            // shape = [1, 2048, 12, 12] --> [1, 2048, 144]
+            embeddings = ggml_reshape_3d(ctx0, embeddings, embeddings->ne[0]*embeddings->ne[1], embeddings->ne[2], embeddings->ne[3]);
+            // shape = [1, 144, 2048]
+            embeddings = ggml_cont(ctx0, ggml_permute(ctx0, embeddings, 1, 0, 2, 3));
+            embeddings = ggml_mul(ctx0, embeddings, model.mm_peg_ls_zeta);
+            // add
+            embeddings = ggml_add(ctx0, embeddings, residual);
         }
         else {
             GGML_ASSERT(false);
@@ -1172,10 +1222,20 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             vision_model.mm_model_block_2_block_1_fc1_b = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_BLOCK, 2, 1, "fc1.bias"));
             vision_model.mm_model_block_2_block_1_fc2_w = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_BLOCK, 2, 1, "fc2.weight"));
             vision_model.mm_model_block_2_block_1_fc2_b = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_BLOCK, 2, 1, "fc2.bias"));
-            vision_model.mm_model_block_2_block_2_0_w   = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_BLOCK, 2, 2, "0.weight"));
-            vision_model.mm_model_block_2_block_2_1_w   = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_BLOCK, 2, 2, "1.weight"));
-            vision_model.mm_model_block_2_block_2_1_b   = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_BLOCK, 2, 2, "1.bias"));
-        } else {
+            vision_model.mm_model_block_2_block_2_0_w = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_BLOCK, 2, 2, "0.weight"));
+            vision_model.mm_model_block_2_block_2_1_w = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_BLOCK, 2, 2, "1.weight"));
+            vision_model.mm_model_block_2_block_2_1_b = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_BLOCK, 2, 2, "1.bias"));
+        }
+        else if (new_clip->proj_type == PROJECTOR_TYPE_PEG) {
+            vision_model.mm_mlp_0_w = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_PEG_MLP, 0, "weight"));
+            vision_model.mm_mlp_0_b = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_PEG_MLP, 0, "bias"));
+            vision_model.mm_mlp_2_w = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_PEG_MLP, 2, "weight"));
+            vision_model.mm_mlp_2_b = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_PEG_MLP, 2, "bias"));
+            vision_model.mm_peg_proj_0_w = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_PEG, 0, "weight"));
+            vision_model.mm_peg_proj_0_b = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_PEG, 0, "bias"));
+            vision_model.mm_peg_ls_zeta = get_tensor(new_clip->ctx_data, "mm.peg.ls.zeta");
+        }
+        else {
             std::string proj_type = PROJECTOR_TYPE_NAMES[new_clip->proj_type];
             throw std::runtime_error(format("%s: don't support projector with: %s currently\n", __func__, proj_type.c_str()));
         }
@@ -1700,18 +1760,6 @@ const int32_t * clip_image_grid(const struct clip_ctx * ctx) {
     return ctx->vision_model.hparams.image_grid_pinpoints;
 }
 
-int clip_n_patches(const struct clip_ctx * ctx) {
-    const auto & params = ctx->vision_model.hparams;
-
-    int n_patches = (params.image_size / params.patch_size) * (params.image_size / params.patch_size);
-
-    if (ctx->proj_type == PROJECTOR_TYPE_LDP) {
-        n_patches /= 4;
-    }
-
-    return n_patches;
-}
-
 bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f32 * img, float * vec) {
     if (!ctx->has_vision_encoder) {
         printf("This gguf file seems to have no vision encoder\n");
@@ -2018,8 +2066,21 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
     }
     if (ctx->proj_type == PROJECTOR_TYPE_MLP_NORM) {
         return ctx->vision_model.mm_3_b->ne[0];
+    } else if (ctx->proj_type == PROJECTOR_TYPE_PEG) {
+        return ctx->vision_model.mm_mlp_0_b->ne[0];
+    } else {
+        std::string proj_type = PROJECTOR_TYPE_NAMES[ctx->proj_type];
+        throw std::runtime_error(format("%s: don't support projector with: %s currently\n", __func__, proj_type.c_str()));
     }
-
-    std::string proj_type = PROJECTOR_TYPE_NAMES[ctx->proj_type];
-    throw std::runtime_error(format("%s: don't support projector with: %s currently\n", __func__, proj_type.c_str()));
 }
+
+int clip_n_patches(const struct clip_ctx * ctx) {
+    auto & params = ctx->vision_model.hparams;
+    int n_patches = (params.image_size / params.patch_size) * (params.image_size / params.patch_size);
+    if (ctx->proj_type == PROJECTOR_TYPE_LDP ||
+        ctx->proj_type == PROJECTOR_TYPE_PEG) {
+        n_patches /= 4;
+    }
+    return n_patches;
+}
+
